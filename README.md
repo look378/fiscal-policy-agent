@@ -187,6 +187,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy_kind.ps1   # 需先安�
 - RAGFlow 与 Dify 两套 RAG 并存，知识库内容相同但切块/索引独立（便于对比两种平台的检索效果）。
 - 内置试用页（http://127.0.0.1:8901/）仅本机演示用：无鉴权、无速率限制；OpenAI 兼容接口的 `stream=true` 是**单 chunk 伪流式**（生成完再推送）。
 - 监控告警**不推送**：仓库未部署 Alertmanager、Grafana 也未配置 Contact Point，Prometheus 规则（7 条）的 firing 只在 Prometheus UI/`/api/v1/alerts` 可见；自研预警服务的告警在 `127.0.0.1:8902/alerts` 与 `logs/` 中。
+- **密钥管理**：仓库不含任何真实部署密钥（`.env`、`.dify*_token`、容器卷均不入库）。`dify015/.env.example` 与 `dify015/docker-compose.yaml` 中的 `SECRET_KEY` 是 Dify 官方示例值，生产环境必须用 `openssl rand -base64 42` 重新生成并写入 `.env`；RAGFlow 的 API Key 通过环境变量或 K8s Secret 注入。
 
 ## 8. 免责声明
 
