@@ -1,210 +1,363 @@
-# 财政政策 AI 智能体（Fiscal Policy AI Agent）
+# 财政政策智能体 · Fiscal Policy AI Agent
 
-> 面向财政/政务场景的政策问答与运行预警系统：**RAGFlow 做文档解析与检索**，自研编排层做**引用强制与无依据拒答**，本地模型生成，配套**实时监控看板与 LLM 异常预警**，容器化部署并支持 Kubernetes 编排。
+> 财政/政务场景的政策问答与运行监控：RAGFlow 负责政策原文解析与条款检索，自研编排层负责引用强制、
+> 数字校验与无依据拒答，本地模型生成；配套评测体系、运行看板与 LLM 异常预警。
 
-`Python` · `RAGFlow` · `Dify 0.15.3` · `Ollama / deepseek-r1` · `FastAPI` · `Prometheus` · `Grafana` · `Kubernetes(kind)` · `LLM-as-judge`
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![RAGFlow](https://img.shields.io/badge/RAGFlow-v0.24-FE6A39)](https://ragflow.io/)
+[![Dify](https://img.shields.io/badge/Dify-0.15.3-1C64F2)](https://dify.ai/)
+[![Ollama](https://img.shields.io/badge/Ollama-deepseek--r1:7b-000000)](https://ollama.com/)
+[![Prometheus](https://img.shields.io/badge/Prometheus-metrics-E6522C?logo=prometheus&logoColor=white)](https://prometheus.io/)
+[![Grafana](https://img.shields.io/badge/Grafana-dashboard-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-kind-326CE5?logo=kubernetes&logoColor=white)](https://kind.sigs.k8s.io/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> 本仓库是**完整可复现的工程实现**：从政策原文清洗、知识库构建、检索问答、引用/拒答约束、评测体系，到监控看板与异常预警，含全部源码、评测数据与三份代码审查报告。
+---
 
-## 1. 解决什么问题
+## 一、简介
 
-| 痛点 | 现状 | 本项目做法 |
+政策问答最容易出的问题不是"检索不到"，而是**答得太像真的**：模型给出一个比例、一个金额、一个期限，
+听起来有出处，实际上是把别的条款、别的地区、甚至训练记忆里的数字串了过来。政务/财政场景里，
+一条错的比例会直接误导申报。
+
+这个项目把"依据"做成硬约束，而不是靠提示词祈祷：
+
+1. **引用可核对**。每条回答都要求标注 `[n]`，接口只返回"答案里确实引用、且确实进入模型上下文"的片段；
+   模型没标引用时返回空引用列表，不伪造来源。
+2. **没依据就拒答**。三层拦截：检索相似度闸门（top1 < 0.33）→ 文本拒答（强拒答词 + 无有效引用）→ 服务异常兜底。
+   拒答与回答分别计数，能看出"是知识库没覆盖，还是模型不肯答"。
+3. **效果可度量、运行可观测**。49 条回归集（含 8 条库外负样本）用 LLM 裁判 + 数字硬校验双轨评测；
+   6 类 Prometheus 指标 + 10 面板看板 + LLM 异常归因预警。
+
+> 当前实测：**48/49 = 98.0%**（正样本 41/41，负样本正确拒答 7/8，平均端到端 18.2s）。
+> 评测口径与已知局限见下文，未达 100% 的原因已逐条记录在 [`eval/badcase_log.md`](eval/badcase_log.md)。
+
+---
+
+## 二、功能一览
+
+### 2.1 政策知识库构建
+
+从公开政策原文（网页/PDF 文本）清洗出条款级 Markdown，并补充 59 条结构化 QA：
+
+| 层 | 内容 | 用途 |
 |---|---|---|
-| 政策文件分散、检索难 | 政策散落在多个网站/PDF，人工翻找 | RAGFlow 解析 5 份政策原文 + 结构化知识库，条款级检索 |
-| 大模型编造政策条款 | 通用模型容易"张冠李戴"，乱给比例和金额 | 引用强制 + 数字逐字校验 + 无依据拒答 |
-| 政策问答质量不可度量 | 上线后没人知道答得对不对 | 49 条回归评测集 + LLM 裁判 + 数字硬校验 |
-| 异常无人发现 | 拒答率升高、延迟劣化靠用户投诉 | Prometheus 指标 + Grafana 看板 + LLM 归因预警 |
+| 原文层 | 5 份财政政策（政府采购促进中小企业发展、政府购买服务、政府采购法实施条例、专项资金、直达资金） | 条款级召回与引用溯源 |
+| QA 层 | 59 条「问题 → 结论 / 依据 / 提示」 | 保证常见问题的回答质量与口径一致 |
 
-## 2. 当前实测结果
+清洗脚本按「第X条」切分、剥离站点导航与页脚（ICP 备案、主办单位等），通知类文档用正文锚点定位；
+结果落 `data/policies_clean/`，索引到 RAGFlow 后共 6 个文档 / 103 个 chunk（bge-m3，1024 维）。
 
-| 指标 | 数值 |
+### 2.2 检索与问答编排
+
+自研 FastAPI 服务（`serving/qa_service.py`），一次问答的编排：
+
+| 步骤 | 做法 | 参数 |
+|---|---|---|
+| 检索 | 调 RAGFlow 混合检索，只对网络/5xx 重试（4xx 直接失败） | `top_k=8`、相似度阈值 0.2 |
+| 上下文装配 | 单块截断 + 总长预算（按实际来源头长度计），只把真正进入 prompt 的片段记为 `used` | 单块 600 字 / 总 3000 字 |
+| 生成 | 调本地 Ollama，推理模型空回答时放大预算重试一次 | `deepseek-r1:7b`、`num_ctx=8192` |
+| 引用判定 | 解析 `[n]` / `【n】` / `[1,2]` / `[1-3]`，过滤越界编号，只保留进过上下文的片段 | — |
+| 拒答判定 | 相似度闸门 + 强拒答词（开头 120 字内）+ 无有效引用 | 闸门 0.33 |
+
+接口：`POST /api/ask`、`POST /v1/chat/completions`（OpenAI 兼容，支持 SSE）、`GET /v1/models`、
+`GET /livez`（存活）、`GET /health`（就绪，依赖不可用返回 503）、`GET /metrics`，以及内置试用页 `GET /`。
+
+### 2.3 引用与拒答的三层边界
+
+```
+检索 → [闸门] top1 < 0.33 → 直接拒答（约 0.5~0.9s，不调用模型）
+            ↓ 通过
+        生成 → [文本] 开头含强拒答词且无有效引用 → 记为文本拒答
+            ↓ 未拒答
+        返回 → citations 只含"被引用 且 进过上下文"的片段；无引用则空 + citation_verified=false
+```
+
+指标上 `refused_total = 闸门拒答 + 文本拒答`，并单列 `refused_gate_total` / `refused_text_total`，
+避免"模型变得爱拒答"和"知识库召回变差"混在一起看不出来。
+
+### 2.4 评测体系（49 条）
+
+| 项 | 说明 |
 |---|---|
-| 知识库 | 6 个文档（59 条 QA + 5 份政策原文），199 个 chunk，bge-m3 向量化 |
-| 评测集 | 49 条（8 条负样本专测"会不会乱编"） |
-| **通过率** | **48/49 = 98.0%**（LLM 裁判 + 数字硬校验复核后） |
-| 正样本 | 41/41 = 100% |
-| 负样本正确拒答 | 7/8 = 87.5% |
-| 平均响应 | 18.2 秒（本地 deepseek-r1:7b，CPU 嵌入） |
-| Bad case | 逐条归因与修复状态见 [`eval/badcase_log.md`](eval/badcase_log.md) |
+| 正样本 | 41 条，覆盖中小企业认定、预留份额、价格评审、采购程序、政府购买服务、专项资金、直达资金 |
+| 负样本 | 8 条库外问题（地方补贴金额、未收录法条、年度额度等），期望模型明确说"没查到" |
+| 裁判 | LLM 裁判先判（temperature=0），再叠确定性硬校验 |
+| 硬校验 | 期望数字必须出现（带边界，`200万元` 不匹配 `1200万元`）；负样本要求"裁判通过 + 无引用 + 无编造数字" |
+| 三态 | PASS / FAIL / SKIP（服务异常或裁判无法解析记 SKIP，不计入通过率） |
 
-> 说明：修复引用/拒答逻辑后最新一轮为 **48/49**；修复前多轮在 87.8%~93.9% 之间波动，主要差异在负样本误判与引用判定。单轮结果仍受采样影响，建议以 3 轮均值为准。
-> 评测口径：LLM 裁判先判，再用「期望数字必须出现在回答里」的硬规则复核，
-> 避免裁判放水（初版裁判把答错的 #12 判成了通过，被这套复核抓出来）。
+### 2.5 运行监控（Prometheus + Grafana）
 
-## 3. 架构
+指标：请求数、拒答数（闸门/文本分列）、错误数、累计延迟（成功与拒答都计）、completion/prompt token、
+进入上下文的片段数。Grafana 10 个面板：QPS、错误率、拒答率、平均延迟、趋势、token 速率、服务存活、
+告警服务检查/触发、待归因/落盘失败/归因失败。
+
+Prometheus 侧另有 7 条规则（服务 down、target 缺失、错误率、延迟、预警服务停滞），带最小样本量门限（≥5），
+避免低流量下"3 次请求 1 次失败"就触发。
+
+### 2.6 LLM 异常预警
+
+`monitoring/alert_service/`：从 Prometheus 拉指标 → 4 条规则（服务 down / 错误率 >10% / 拒答率 >40% /
+平均延迟 >20s）→ 连续 2 次命中才触发（去抖）→ 告警先落盘，再异步调用本地 LLM 生成「可能原因 / 处置建议 /
+是否需人工」，结果回写 JSONL 与 `/alerts`。重启时回放历史、恢复冷却窗口，遗留 pending 标记为 orphaned。
+
+### 2.7 平台集成与交付
+
+- **Dify 0.15.3**：知识库（hybrid_search / top_k=4）+ 对话应用绑定 + 引用开关，脚本会建库后回读断言，
+  避免"配置被接口静默丢弃"的假成功；端到端冒烟断言检索引用非空。
+- **容器化**：`fiscal-qa` / `fiscal-alert` 两个镜像，非 root 运行，健康检查指向 `/livez`。
+- **Kubernetes（kind）**：Namespace / Secret / ConfigMap / 两个 Deployment / Service / HPA / PDB，
+  含 `command+args` 启动、`fsGroup` 卷权限、readiness 与 liveness 分离。
+
+---
+
+## 三、架构
+
+### 3.1 分层设计
 
 ```
-财政政策原文(PDF/网页)
-        │
-        ├──────────────────────────┐
-        ▼                          ▼
-┌────────────────────┐   ┌───────────────────────────┐
-│ RAGFlow（Docker）  │   │ Dify 0.15.3（Docker）      │
-│ ├ 文档解析/切块     │   │ ├ 知识库（6 文档已索引）    │
-│ ├ bge-m3 向量化    │   │ ├ 对话应用（绑定知识库）    │
-│ └ 混合检索 API     │   │ └ 编排/会话/引用            │
-└─────────┬──────────┘   └─────────────┬─────────────┘
-          │                            │
-          ▼                            ▼
-┌──────────────────────────┐   本地 Ollama (deepseek-r1:7b)
-│ 自研问答编排层 FastAPI    │   本地 bge-m3 embedding 服务
-│ ├ 检索（top_k=8）         │
-│ ├ 引用强制 + 数字校验      │
-│ ├ 无依据拒答（三层）       │
-│ └ OpenAI 兼容接口         │
-└─────────────┬────────────┘
-              ▼
-   Prometheus（19090）──▶ Grafana 看板（13000）
-              │
-              ▼
-   LLM 异常预警服务（8902）
-   （规则判定 → LLM 生成原因+处置建议 → /alerts）
-
-   Kubernetes（kind）：Deployment / Service / HPA
+数据层    政策原文清洗 → 条款级 Markdown + 结构化 QA（data/）
+   ↓
+检索层    RAGFlow（解析 / 切块 / bge-m3 向量化 / 混合检索）
+   ↓
+编排层    FastAPI：检索 → 上下文预算 → 生成 → 引用判定 → 拒答判定（serving/qa_service.py）
+   ↓
+能力层    Ollama deepseek-r1:7b（生成）· bge-m3 本地服务（向量化，OpenAI 兼容）
+   ↓
+观测层    Prometheus 指标 → Grafana 看板 · 预警服务（规则 + LLM 归因）
+   ↓
+交付层    Docker Compose / Kubernetes（kind）· Dify 平台对照实现
 ```
 
-## 3.1 在线服务一览
+### 3.2 一次问答的主流程
 
-| 服务 | 地址 | 说明 |
-|---|---|---|
-| RAGFlow | http://localhost/（API :9380） | 文档解析 + 混合检索 |
-| Dify | http://localhost:8080 | 知识库 + 对话应用（本地演示账号：admin@fiscal.local / `Fiscal@2026`） |
-| 自研问答服务 | http://127.0.0.1:8901/api/ask | 引用强制 + 拒答 + Prometheus 指标（内置试用页 `GET /`） |
-| 本地 embedding | http://127.0.0.1:8900/v1 | bge-m3（OpenAI 兼容） |
-| 异常预警服务 | http://127.0.0.1:8902/alerts | 规则 → LLM 归因 |
-| Prometheus | http://localhost:19090 | 指标存储（15s 抓取，7 条告警规则） |
-| Grafana | http://localhost:13000 | 看板「财政政策智能体 · 运行监控」（本地演示账号：admin / `fiscal2026`） |
-| Ollama | http://localhost:11434 | deepseek-r1:7b 本地推理 |
+```
+POST /api/ask
+  ├─ 参数校验（空/空白 → 422）
+  ├─ RAGFlow 检索（top_k=8，失败按瞬态错误重试）
+  ├─ 相似度闸门：top1 < 0.33 → 拒答（refused_by=gate）
+  ├─ 上下文装配：used = 真正进入 prompt 的片段
+  ├─ Ollama 生成（空回答 → 放大预算重试一次）
+  ├─ 引用解析：只保留"被引用 且 在 used 中"的片段
+  ├─ 文本拒答：开头 120 字含强拒答词 且 无有效引用 → refused_by=text
+  └─ 返回 answer / citations / citation_verified / refused / retrieved / top_similarity / latency_ms
+```
 
-> 以上账号/口令均为**本地 Docker 演示默认值**，请勿用于公网部署；生产环境用环境变量或 Secret 覆盖（见 `.env.example`）。
-
-
-## 4. 目录结构
+### 3.3 目录结构
 
 ```
 财政AI智能体/
-├── data/
-│   ├── policies/            # 政策原文（网页抓取，*.txt 不入库）
-│   ├── policies_clean/       # 清洗后按条款结构化（入库）
-│   ├── knowledge_base.md     # 结构化知识库（59 条 QA）
-│   └── finetune/             # LoRA 微调数据集（*.jsonl 不入库，可重建）
-├── eval/
-│   ├── eval_set.md           # 49 条回归评测集
-│   ├── eval_final.md         # 评测结果（裁判 + 数字硬校验）
-│   ├── eval_judge.json       # 逐题原始回答
-│   └── badcase_log.md        # bad case 归因与修复记录
+├── data/                     # 政策原文、清洗结果、知识库、微调数据构造
+├── eval/                     # 49 条评测集、评测结果、逐题原始数据、badcase 台账
 ├── prompts/system_prompt.md  # 系统提示词（服务端与 Dify 共用）
-├── scripts/                  # 抓取/清洗/导入/评测/回归/Dify 配置脚本
-├── serving/
-│   ├── qa_service.py         # 问答编排服务（含试用页 / SSE / metrics）
-│   ├── embed_server.py       # 本地 bge-m3 embedding 服务
-│   ├── refusal_markers.py    # 拒答词表（服务端与评测共用）
-│   └── Dockerfile / Dockerfile.embed
-├── finetune/
-│   ├── build_dataset.py      # 知识库 → 与线上对齐的 SFT 数据集
-│   ├── train_lora.py         # Qwen2.5 LoRA（bf16）
-│   ├── merge_export.py       # 合并 adapter / 导出
-│   └── README.md             # 微调方案与依赖说明
-├── monitoring/
-│   ├── prometheus.yml        # 抓取配置
-│   ├── prometheus-rules.yml  # 7 条告警规则
-│   ├── docker-compose.yml    # Prometheus + Grafana（+ 可选容器化告警服务）
-│   ├── grafana/              # 数据源/看板自动配置（10 面板）
-│   └── alert_service/        # LLM 异常预警（规则→归因→落盘）
-├── k8s/manifests.yaml        # Namespace/Secret/ConfigMap/Deployment/Service/HPA/PDB
-├── dify015/                  # Dify 0.15.3 部署配置（.env 与 volumes 不入库）
-├── ragflow/                  # RAGFlow 部署配置（.env 与 logs 不入库）
-├── docs/                     # 技术解析 / 三份审查报告 / 试用指南
+├── scripts/                  # 抓取清洗、知识库导入、评测回归、Dify 配置、启动与部署
+├── serving/                  # 问答编排服务、embedding 服务、拒答词表、两个 Dockerfile
+├── finetune/                 # SFT 数据构造、LoRA 训练、合并导出、方案说明
+├── monitoring/               # Prometheus 配置与规则、Grafana 看板、LLM 预警服务
+├── k8s/manifests.yaml        # kind 部署清单（Secret 用占位符）
+├── dify015/ ragflow/         # 两套平台部署配置（.env 与数据卷不入库）
+├── docs/                     # 技术解析、试用指南、三份代码审查报告
 ├── .env.example              # 环境变量模板
-├── LICENSE
+├── .github/workflows/ci.yml  # CI：Python 编译 + YAML/JSON 校验 + 必需文件检查
 └── README.md
 ```
 
-> **仓库不含**：模型权重、容器数据卷（`*/volumes/`、`monitoring/data/`）、运行日志、`*.env`、`.dify*_token`、`参考资料/`（第三方 Helm 模板）与 `archive/`（历史归档）。这些都能按下文步骤重建。
+---
 
-## 5. 关键技术决策（面试可讲）
+## 四、快速开始
 
-| 决策 | 原因 |
-|---|---|
-| RAGFlow 只做解析+检索，问答编排自研 | RAGFlow 内置对话流程黑盒、不好做引用硬约束；自研层能精确控制提示词、数字校验与拒答 |
-| 不用推理模型直接问答 | deepseek-r1 会把 token 花在思考上且易编数字，必须配硬约束与上下文 |
-| LLM 裁判 + 数字硬校验双轨评测 | 纯关键词会误判（实测把正确答案判失败），纯裁判会放水（实测把错答案判通过） |
-| 知识库既有 QA 也有原文 | QA 保证回答质量，原文保证条款级召回与引用溯源 |
-| LoRA 用 bf16 不用 QLoRA | RTX 5060 是 Blackwell(sm_120)，bitsandbytes 支持不稳 |
-| 微调只解决"格式与纪律" | 政策知识靠检索注入，不靠模型记忆（避免知识过期与幻觉） |
+### 4.1 前置条件
 
-## 6. 快速启动
+- Windows（脚本按 PowerShell 5.1 兼容处理）或 Linux/macOS
+- Docker Desktop（RAGFlow、Dify、Prometheus/Grafana 都用容器）
+- Python 3.11+
+- Ollama + `deepseek-r1:7b`；bge-m3 权重目录（本地 embedding 服务需要）
 
-先准备环境变量（不设置时使用本机演示默认值）：
-`cp .env.example .env`，或 PowerShell 里 `$env:RAGFLOW_KEY="ragflow-..."`。
+### 4.2 一键启动
 
-> 两套第三方栈的环境文件：`ragflow/.env` 与 `dify015/.env` 不入库，需分别从各自目录的
-> `.env.example` 复制并修改密码（已有数据卷时沿用原密码）。
+```powershell
+# 环境变量：不设置时使用本机演示默认值
+copy .env.example .env
+
+# RAGFlow + embedding + 问答 + 预警 + 监控
+powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1
+
+# 可选参数：-BgePath <bge-m3 目录>；-SkipMonitoring 跳过监控栈
+```
+
+### 4.3 分步启动
 
 ```bash
-# 0) 一键启动（推荐）：RAGFlow + embedding + 问答 + 预警 + 监控
-powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1
-#   可指定 bge-m3 模型目录： ... -BgePath <目录>；跳过监控： -SkipMonitoring
-
-# 手动分步：
-# 1) RAGFlow（工作目录 ragflow/）
+# 1) RAGFlow（工作目录 ragflow/，首次需 cp .env.example .env）
 docker compose -p fiscal-ragflow up -d
 
-# 2) 本地 embedding 与问答服务
+# 2) 本地 embedding + 问答服务
 python serving/embed_server.py --model-path <bge-m3目录> --port 8900
-python serving/qa_service.py --port 8901          # 容器内需加 --host 0.0.0.0
+python serving/qa_service.py --port 8901        # 容器内需加 --host 0.0.0.0
 
-# 3) 导入知识库（首次；文件路径相对仓库根）
+# 3) 知识库首次导入（文件路径相对仓库根）
 python scripts/import_kb.py --key <RAGFLOW_KEY> \
-    --files data/knowledge_base.md data/policies_clean/01_政府采购促进中小企业发展管理办法_财库2020-46号.md
+    --files "data/knowledge_base.md" "data/policies_clean/*.md"
 
-# 4) 跑评测
-python scripts/eval_judge.py      # LLM 裁判 → eval/eval_judge.json
-python scripts/eval_verify.py     # 加数字硬校验复核 → eval/eval_final.md
-
-# 5) 监控与预警
+# 4) 监控与预警
 cd monitoring && docker compose up -d
 python monitoring/alert_service/alert_service.py --port 8902
 
-# 6) Dify（0.15.3，工作目录 dify015/）
+# 5) Dify 0.15.3（工作目录 dify015/，首次需 cp .env.example .env）
 docker compose -p dify015 up -d
-python scripts/setup_dify015_models.py     # 注册本地模型
-python scripts/setup_dify015_app.py       # 建知识库 + 索引文档 + 建应用
-python scripts/bind_dify_dataset.py        # 绑定知识库（含 enabled / 引用开关）
-python scripts/test_dify_app.py "预留份额比例是多少？"   # 断言检索引用非空
+python scripts/setup_dify015_models.py
+python scripts/setup_dify015_app.py
+python scripts/bind_dify_dataset.py
+python scripts/test_dify_app.py "预留份额比例是多少？"   # 断言引用非空
 
-# 7) 容器化与 K8s
+# 6) 容器镜像与 kind 集群
 powershell -ExecutionPolicy Bypass -File scripts\build_images.ps1
-powershell -ExecutionPolicy Bypass -File scripts\deploy_kind.ps1   # 需先安装 kind
+powershell -ExecutionPolicy Bypass -File scripts\deploy_kind.ps1   # 需安装 kind
 ```
 
-## 7. 已知限制与踩坑
+### 4.4 验证
 
-- **Dify 版本选择**：先部署了 1.18/1.1.3（插件架构），模型供应商插件在 daemon 层装成功但 API 层识别不到，**降级到 0.15.3（内置供应商）**后一次跑通；
-- 本机网络对 Docker Hub 不稳定（DNS 污染 `registry-1.docker.io → 31.13.69.169`），依赖国内镜像站 + 多次重试；
-- 微调脚本与数据已就绪，但本机 torch 为 CPU 版、大文件下载限速（0.18MB/s），**未实跑训练**；
-- 生成模型为本地 deepseek-r1:7b（推理模型）：**端到端**约 15~25 秒/题（含检索、生成、引用），其中纯生成约 12~18 秒；embedding 走 CPU（bge-m3），首问较慢；
-- RAGFlow 与 Dify 两套 RAG 并存，知识库内容相同但切块/索引独立（便于对比两种平台的检索效果）。
-- 内置试用页（http://127.0.0.1:8901/）仅本机演示用：无鉴权、无速率限制；OpenAI 兼容接口的 `stream=true` 是**单 chunk 伪流式**（生成完再推送）。
-- 监控告警**不推送**：仓库未部署 Alertmanager、Grafana 也未配置 Contact Point，Prometheus 规则（7 条）的 firing 只在 Prometheus UI/`/api/v1/alerts` 可见；自研预警服务的告警在 `127.0.0.1:8902/alerts` 与 `logs/` 中。
-- **密钥管理**：仓库不含任何真实部署密钥（`.env`、`.dify*_token`、容器卷均不入库）。`dify015/.env.example` 与 `dify015/docker-compose.yaml` 中的 `SECRET_KEY` 是 Dify 官方示例值，生产环境必须用 `openssl rand -base64 42` 重新生成并写入 `.env`；RAGFlow 的 API Key 通过环境变量或 K8s Secret 注入。
+```bash
+# 存活 / 就绪 / 指标
+curl http://127.0.0.1:8901/livez
+curl http://127.0.0.1:8901/health
+curl http://127.0.0.1:8901/metrics
 
-## 8. 免责声明
+# 问答冒烟（正常问题应带引用；库外问题应 1s 内拒答）
+curl -s -X POST http://127.0.0.1:8901/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"中小企业参与政府采购，预留份额比例是多少？"}'
+```
 
-个人学习与作品展示用途，不构成财政、法律或审计意见；政策条款以官方最新发布为准。
+页面：自研试用页 http://127.0.0.1:8901/ ｜ Grafana http://localhost:13000 ｜ Dify http://localhost:8080
 
-## 9. 文档导航
+---
+
+## 五、实测结果与评测口径
+
+| 指标 | 数值 |
+|---|---|
+| 知识库 | 6 个文档（59 条 QA + 5 份政策原文）/ 103 个 chunk / bge-m3（1024 维） |
+| 评测集 | 49 条（41 正 + 8 负） |
+| 总通过率 | **48/49 = 98.0%** |
+| 正样本 | 41/41 = 100% |
+| 负样本正确拒答 | 7/8 = 87.5% |
+| 平均端到端延迟 | 18.2s（本地 deepseek-r1:7b，CPU embedding） |
+| 评测降级 / SKIP | 0 / 0 |
+
+口径说明：
+
+- 裁判与硬校验**分开各司其职**：裁判判断"意思对不对"，硬校验只做确定性检查（数字是否出现、负样本是否声明未找到且无编造）。
+  纯关键词法会把"措辞不同但正确"判错（实测 30.6%）；纯 LLM 裁判会放水（实测 91.7% 虚高）。
+- 硬校验用数字边界匹配，避免 `200万元` 被 `1200万元` 误命中；区间数字命中任一合法端点即算出现。
+- 唯一失败题（#44 投诉处理期限）是知识库确实未收录该法条、模型倾向硬答，归因与修复建议见 badcase 台账。
+- 单轮结果仍受采样影响；修复引用/拒答逻辑前多轮在 87.8%~93.9% 波动，建议以多轮均值为准。
+
+---
+
+## 六、技术栈
+
+### 6.1 核心技术选型
+
+| 层 | 选型 | 说明 |
+|---|---|---|
+| 文档解析/检索 | RAGFlow v0.24 | 解析、切块、bge-m3 向量化、混合检索 API |
+| 向量化 | bge-m3（本地服务，OpenAI 兼容） | 1024 维，CPU 推理 |
+| 生成 | Ollama `deepseek-r1:7b` | 本地推理，不依赖外部 API |
+| 问答编排 | FastAPI（自研） | 检索、上下文预算、引用/拒答、指标 |
+| 评测 | LLM-as-judge + 数字硬校验 + 负样本确定性 | 见第五节 |
+| 监控 | Prometheus + Grafana | 指标 + 7 条规则 + 10 面板 |
+| 异常预警 | 自研（规则 + LLM 归因） | 规则判定、去抖、异步归因、JSONL 回放 |
+| 平台对照 | Dify 0.15.3 | 知识库/应用/引用链路对照 |
+| 部署 | Docker Compose / Kubernetes(kind) | 非 root 镜像、健康检查、探针与 PDB |
+
+### 6.2 关键取舍
+
+| 取舍 | 原因 |
+|---|---|
+| RAGFlow 只做解析+检索，问答编排自研 | 平台内置对话流程不可控，做不了引用强制、数字校验与拒答分层 |
+| 生成用推理模型 + 硬约束 | 7B 推理模型会编数字；靠"上下文预算 + 提示词硬约束 + 引用判定 + 拒答"兜底，而不是换更大模型 |
+| 知识库 QA 与原文并存 | QA 保证常见问题答案口径，原文保证条款级召回与可核对引用 |
+| 微调用 bf16 LoRA 而非 QLoRA | RTX 5060 是 Blackwell(sm_120)，bitsandbytes 支持不稳；训练只固化输出纪律，不灌知识 |
+| 微调数据按线上 prompt 结构构造 | 训练样本带检索上下文与 `[n]` 引用，避免 train-serve 偏差 |
+| 告警不接 Alertmanager | 本机部署无推送通道，规则状态在 Prometheus UI 与 `/alerts` 可见；接通知需另配 Alertmanager 或 Grafana Contact Point |
+
+---
+
+## 七、配置说明
+
+主要环境变量（完整列表见 [`.env.example`](.env.example)）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `RAGFLOW_BASE` / `RAGFLOW_KEY` / `RAGFLOW_DATASET` | `http://localhost:9380` / 内置演示值 / 数据集 ID | RAGFlow 检索入口 |
+| `OLLAMA_BASE` / `OLLAMA_MODEL` | `http://127.0.0.1:11434` / `deepseek-r1:7b` | 本地生成 |
+| `TOP_K` / `SIM_THRESHOLD` | `8` / `0.2` | 检索条数与初筛阈值 |
+| `MIN_SIM_TO_ANSWER` | `0.33` | 相似度闸门，低于则直接拒答 |
+| `MAX_TOKENS` / `NUM_CTX` | `1536` / `8192` | 生成预算与上下文窗口 |
+| `CHUNK_CHARS` / `MAX_CTX_CHARS` | `600` / `3000` | 单块截断与总上下文预算 |
+| `MODEL_PATH` | — | bge-m3 权重的本地路径（embedding 服务） |
+| `PROM_URL` | `http://localhost:19090` | 预警服务拉取指标的 Prometheus |
+| `MIN_SAMPLES` / `CONSECUTIVE` | `5` / `2` | 预警最小样本量与去抖次数 |
+| `DIFY_BASE` / `DIFY_EMAIL` / `DIFY_PASSWORD` | `http://localhost:8080` / 演示账号 | Dify 配置脚本使用 |
+
+> 仓库内所有默认账号与口令均为**本机演示值**，生产环境用环境变量或 Secret 覆盖；
+> `dify015/.env.example` 中的 `SECRET_KEY` 是 Dify 官方示例，生产必须用 `openssl rand -base64 42` 重新生成。
+
+---
+
+## 八、测试与自检
+
+| 检查 | 命令 | 期望 |
+|---|---|---|
+| Python 语法 | `python -m compileall serving scripts finetune monitoring/alert_service` | 全部通过（CI 已覆盖） |
+| 配置合法性 | CI 校验全部 YAML/JSON | 通过 |
+| 服务存活/就绪 | `GET /livez` / `GET /health` | 200 / 200（依赖不可用 503） |
+| 全量评测 | `python scripts/eval_judge.py` → `python scripts/eval_verify.py` | 生成 `eval/eval_final.md`，exit 0 |
+| 单题回归 | `python scripts/eval_regress.py --nos 1 7 44` | 通过 exit 0，失败 exit 1，服务异常 SKIP exit 2 |
+| Dify 检索断言 | `python scripts/test_dify_app.py "..."` | 引用条数 > 0，否则 exit 2 |
+| 告警服务 | `GET /alerts`、`GET /metrics` | 返回历史告警与 6 类指标 |
+
+CI（GitHub Actions）在每次 push 时执行：Python 编译、YAML/JSON 校验、必需文件检查。历史运行见仓库 Actions 页。
+
+---
+
+## 九、文档索引
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/技术解析.md`](docs/技术解析.md) | 架构取舍、检索/生成/评测/监控四层设计、关键指标口径 |
-| [`docs/试用指南.md`](docs/试用指南.md) | 各前端页面入口、账号、建议试用顺序 |
-| [`docs/新增代码审查.md`](docs/新增代码审查.md) | 第三轮审查：新增页面/SSE/告警/脚本的 3 个独立复审结论与修复 |
-| [`docs/代码审查报告-v2.md`](docs/代码审查报告-v2.md) | 第二轮独立全面审查（5 BLOCKER / 30 HIGH）与修复状态 |
-| [`docs/代码审查报告.md`](docs/代码审查报告.md) | 第一轮审查：8 BLOCKER + 工程化问题清单 |
-| [`eval/badcase_log.md`](eval/badcase_log.md) | 逐条 bad case 归因、修复动作与回归结果 |
-| [`finetune/README.md`](finetune/README.md) | 微调数据构造（与线上 prompt 对齐）、依赖版本、导出步骤 |
+| [`docs/技术解析.md`](docs/技术解析.md) | 检索/生成/评测/监控四层设计、参数依据、指标口径 |
+| [`docs/试用指南.md`](docs/试用指南.md) | 各页面入口、账号、建议试用顺序与常见问题 |
+| [`docs/新增代码审查.md`](docs/新增代码审查.md) | 第三轮审查：新增页面/SSE/告警/脚本的复查结论与修复 |
+| [`docs/代码审查报告-v2.md`](docs/代码审查报告-v2.md) | 第二轮独立全面审查（5 BLOCKER / 30 HIGH）与修复证据 |
+| [`docs/代码审查报告.md`](docs/代码审查报告.md) | 第一轮审查：8 BLOCKER 与工程化问题清单 |
+| [`eval/badcase_log.md`](eval/badcase_log.md) | bad case 归因、修复动作与回归结果 |
+| [`finetune/README.md`](finetune/README.md) | 微调数据构造（对齐线上 prompt）、依赖版本、合并导出 |
 
-## 10. License
+---
+
+## 十、已知限制（如实说明）
+
+1. **生成慢**：本地 7B 推理模型端到端约 15~25s/题（CPU embedding），交互体验受限于算力，非检索链路问题。
+2. **微调未实跑**：本机 torch 为 CPU 版、模型下载限速，训练脚本与数据已就绪但未完成训练与效果对比。
+3. **评测为单轮**：当前 49 条为单轮问答；多轮追问与指代消解未覆盖。
+4. **两套 RAG 并存**：RAGFlow 与 Dify 知识库内容相同但切块/索引独立，用于对照两种平台效果，不是生产级统一检索。
+5. **SSE 为单 chunk 伪流式**：生成完成后一次推送，真流式需改造生成链路。
+6. **无鉴权与限流**：服务默认只监听 127.0.0.1，容器/K8s 场景需在网关层加认证与限流。
+7. **告警不推送**：未部署 Alertmanager，规则仅在 Prometheus UI / `/alerts` 可见。
+8. **索引需随清洗结果重建**：`data/policies_clean/` 更新后需重新运行 `import_kb.py`，否则 RAGFlow 检索仍是旧内容。
+9. **评测集与训练集的同题风险**：评测集有部分题与知识库 QA 同题，微调前后对比时应剔除同题或分组报告。
+
+---
+
+## 免责声明
+
+本项目用于技术验证与学习，不构成财政、法律或审计意见；政策条款以官方最新发布为准。
+示例政策文本来自公开渠道，仅用于检索与引用演示。
+
+---
+
+## License
 
 [MIT](LICENSE) © 2026 look378
