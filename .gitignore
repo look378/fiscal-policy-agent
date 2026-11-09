@@ -1,0 +1,68 @@
+# ===== 密钥与凭据（绝不入库）=====
+.env
+.env.*
+!.env.example
+.dify_token
+.dify015_token
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ===== 运行产物 =====
+logs/
+*.log
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== 数据与模型（体积大 / 运行时生成，不入库）=====
+models/
+_download/
+data/finetune/*.jsonl
+data/policies/*.txt
+monitoring/data/
+monitoring/alert_service/data/
+dify/volumes/
+dify015/volumes/
+ragflow/ragflow-logs/
+# 微调产物（adapter / 合并模型 / GGUF 很大）
+finetune/output/
+finetune/merged/
+*.gguf
+*.safetensors
+*.bin
+
+# ===== 第三方部署目录内的运行时数据 =====
+dify/volumes/**/data/
+dify015/volumes/**/data/
+
+# ===== 历史产物（保留当前有效结果，历史归档不入库）=====
+archive/
+参考资料/
+
+# ===== 评测中间产物（保留 eval_final.md / eval_judge.json / badcase）=====
+eval/eval_results.*
+eval/eval_judge.md
+eval/eval_v2.md
+eval/eval_v3.md
+eval/regress.json
+eval/dify_test_result.json
+
+# ===== 编辑器 / 系统文件 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+*~
+*.swp
+
+# ===== 临时文件 =====
+*.tmp
+*.bak

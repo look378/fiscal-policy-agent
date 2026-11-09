@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # 显式设置抓取超时，避免默认 10s 与长请求互相踩（问答服务单题可能 20s+，但 /metrics 本身应秒回）
+  scrape_timeout: 8s
+
+# 规则文件：即使 alert_service 挂了，Prometheus 自己也能发现"抓不到目标"
+rule_files:
+  - /etc/prometheus/prometheus-rules.yml
+
+scrape_configs:
+  # 自研问答服务（RAGFlow 检索 + 本地模型生成 + 三层拒答）
+  - job_name: 'fiscal-qa-service'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:8901']
+        labels:
+          service: 'qa-service'
+
+  # LLM 异常预警服务自身
+  - job_name: 'fiscal-alert-service'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:8902']
+        labels:
+          service: 'alert-service'
+
+  # Prometheus 自身
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

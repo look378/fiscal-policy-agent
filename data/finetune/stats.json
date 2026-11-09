@@ -1,0 +1,10 @@
+{
+  "kb_qa": 59,
+  "refusal": 10,
+  "total": 69,
+  "train": 59,
+  "dev": 10,
+  "with_citation": 59,
+  "avg_output_chars": 218.8,
+  "avg_prompt_chars": 470.7
+}

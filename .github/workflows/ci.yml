@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python syntax check
+        run: |
+          python -m compileall -q serving scripts finetune monitoring/alert_service
+          echo "Python syntax OK"
+
+      - name: Validate YAML / JSON configs
+        run: |
+          pip install --quiet pyyaml
+          python - <<'PY'
+          import json, sys, yaml, glob
+
+          ok = True
+          files = glob.glob('**/*.yaml', recursive=True) + glob.glob('**/*.yml', recursive=True)
+          files = [f for f in files if not f.startswith(('.github/', 'dify015/volumes', 'ragflow/ragflow-logs'))]
+          for f in files:
+              try:
+                  list(yaml.safe_load_all(open(f, encoding='utf-8')))
+              except Exception as e:
+                  ok = False
+                  print(f'YAML FAIL {f}: {e}')
+
+          for f in glob.glob('**/*.json', recursive=True):
+              if f.startswith(('dify015/volumes', 'ragflow/ragflow-logs')):
+                  continue
+              try:
+                  json.load(open(f, encoding='utf-8'))
+              except Exception as e:
+                  ok = False
+                  print(f'JSON FAIL {f}: {e}')
+
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Check required files
+        run: |
+          for f in README.md LICENSE .env.example serving/qa_service.py prompts/system_prompt.md; do
+            test -f "$f" || { echo "missing $f"; exit 1; }
+          done
+          echo "required files OK"

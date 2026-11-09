@@ -1,0 +1,23 @@
+# 构建上下文排除项（避免把 GB 级数据/环境打进镜像）
+# 镜像只需要 serving/ + prompts/，其余全部排除可把上下文从 ~160MB 降到 ~50KB
+dify/
+dify015/
+ragflow/
+_download/
+models/
+logs/
+monitoring/data/
+data/
+eval/
+docs/
+archive/
+k8s/
+finetune/output/
+finetune/merged/
+**/__pycache__/
+**/*.pyc
+**/*.jsonl
+.env
+.env.*
+*.log
+.git/

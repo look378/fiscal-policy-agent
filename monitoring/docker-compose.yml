@@ -1,0 +1,88 @@
+# 监控栈：Prometheus + Grafana (+ 可选：容器化的 LLM 预警服务)
+# 说明：
+#   - 镜像用 latest 便于快速搭建；生产建议钉版本或 digest（docker inspect 取 RepoDigests）
+#   - Grafana 管理员密码通过环境变量注入，默认值仅用于本地开发
+#   - 预警服务默认由宿主机运行（scripts/start_all.ps1）；若要用容器跑，加 --profile with-alert
+#     注意：默认宿主机运行已占用 8902，切容器前先停掉宿主进程
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fiscal-prometheus
+    restart: unless-stopped
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules.yml:/etc/prometheus/prometheus-rules.yml:ro
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fiscal-grafana
+    restart: unless-stopped
+    ports:
+      - "13000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-fiscal2026}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      # Grafana 首次启动要跑数据库迁移，约 1~2 分钟才监听端口；给足启动宽限期避免一开始就报 unhealthy
+      start_period: 90s
+
+  # 可选：容器化预警服务（docker compose --profile with-alert up -d）
+  alert-service:
+    profiles: ["with-alert"]
+    build:
+      context: ..
+      dockerfile: monitoring/alert_service/Dockerfile
+    image: fiscal-alert:1.0.0
+    container_name: fiscal-alert
+    restart: unless-stopped
+    command: ["python", "alert_service.py", "--host", "0.0.0.0", "--port", "8902", "--interval", "60"]
+    ports:
+      - "127.0.0.1:8902:8902"
+    environment:
+      # 容器内用服务名访问 Prometheus；Ollama 跑在宿主机
+      PROM_URL: http://prometheus:9090
+      OLLAMA_BASE: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-deepseek-r1:7b}
+      HOST: 0.0.0.0
+      STALE_SECONDS: "300"
+    volumes:
+      - ./alert_service/data:/app/data     # 告警历史持久化（容器重建不丢）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8902/livez',timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

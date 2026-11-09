@@ -1,0 +1,19 @@
+# 统一换行符，避免 Windows 开发导致整个仓库 diff 噪声
+* text=auto eol=lf
+
+# 脚本按平台保留原样
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.gguf binary
+*.safetensors binary

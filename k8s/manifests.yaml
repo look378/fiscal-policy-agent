@@ -1,0 +1,253 @@
+# 财政政策问答服务 · Kubernetes 部署清单
+#
+# 前置：
+#   1) 构建镜像：powershell -File scripts\build_images.ps1
+#   2) 创建 kind 集群并加载镜像：powershell -File scripts\deploy_kind.ps1
+#      （deploy_kind.ps1 会检测 kind 网关 IP 并替换本文件中的 __HOST_GATEWAY__）
+#
+# 说明：
+#   - 服务默认只监听 127.0.0.1，容器内必须用 --host 0.0.0.0，否则探针必失败
+#   - kind 集群内没有 host.docker.internal，需用 hostAliases 指向宿主机网关
+#   - RAGFLOW_KEY 属敏感信息，走 Secret，不写进 ConfigMap
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fiscal
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fiscal-secrets
+  namespace: fiscal
+type: Opaque
+stringData:
+  # 占位符：部署前替换成你自己的 RAGFlow API Key（或改用 sealed-secrets / ExternalSecret）。
+  # 公开仓库不要提交真实 Key。
+  RAGFLOW_KEY: "REPLACE_WITH_YOUR_RAGFLOW_KEY"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fiscal-qa-config
+  namespace: fiscal
+data:
+  # __HOST_GATEWAY__ 会被 scripts/deploy_kind.ps1 替换成宿主机在 kind 网络里的 IP
+  RAGFLOW_BASE: "http://__HOST_GATEWAY__:9380"
+  RAGFLOW_DATASET: "794dc7aed20c11f1a3208fc00a9044d2"
+  OLLAMA_BASE: "http://__HOST_GATEWAY__:11434"
+  OLLAMA_MODEL: "deepseek-r1:7b"
+  TOP_K: "8"
+  SIM_THRESHOLD: "0.2"
+  MIN_SIM_TO_ANSWER: "0.33"
+  MAX_TOKENS: "1536"
+  CHUNK_CHARS: "600"
+  MAX_CTX_CHARS: "3000"
+  NUM_CTX: "8192"
+  HOST: "0.0.0.0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fiscal-alert-config
+  namespace: fiscal
+data:
+  PROM_URL: "http://__HOST_GATEWAY__:19090"
+  OLLAMA_BASE: "http://__HOST_GATEWAY__:11434"
+  OLLAMA_MODEL: "deepseek-r1:7b"
+  HOST: "0.0.0.0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fiscal-qa
+  namespace: fiscal
+  labels: { app: fiscal-qa }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: fiscal-qa }
+  template:
+    metadata:
+      labels: { app: fiscal-qa }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8901"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 依赖宿主机上的 RAGFlow / Ollama
+      hostAliases:
+        - ip: "__HOST_GATEWAY__"
+          hostnames: ["host.docker.internal"]
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001            # 让挂载卷归属运行用户，否则非 root 写不了
+      containers:
+        - name: qa
+          image: fiscal-qa:1.0.0
+          imagePullPolicy: IfNotPresent
+          # 必须同时给 command：只写 args 会整体替换镜像 CMD，导致容器入口变成 "--host" 而 CrashLoop
+          command: ["python", "/app/qa_service.py"]
+          args: ["--host", "0.0.0.0", "--port", "8901"]
+          ports:
+            - name: http
+              containerPort: 8901
+          envFrom:
+            - configMapRef: { name: fiscal-qa-config }
+            - secretRef: { name: fiscal-secrets }
+          startupProbe:
+            httpGet: { path: /livez, port: 8901 }
+            failureThreshold: 30
+            periodSeconds: 3
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet: { path: /health, port: 8901 }   # 依赖不可达 → 503，不接流量
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /livez, port: 8901 }    # 只判进程存活，避免依赖抖动导致重启
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }      # 等 endpoint 收敛，避免滚动更新 502
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fiscal-qa
+  namespace: fiscal
+spec:
+  selector: { app: fiscal-qa }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8901
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fiscal-qa-hpa
+  namespace: fiscal
+spec:
+  # 注意：负载是 I/O 型（单题 12~18 秒），CPU 利用率很低，CPU 指标基本不会触发扩容；
+  # 这里保留 HPA 仅作为演示，生产应改用自定义指标（如 QPS / 队列长度）。
+  # kind 集群默认没有 metrics-server，TARGETS 会显示 unknown。
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fiscal-qa
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fiscal-alert
+  namespace: fiscal
+  labels: { app: fiscal-alert }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fiscal-alert }
+  template:
+    metadata:
+      labels: { app: fiscal-alert }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8902"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostAliases:
+        - ip: "__HOST_GATEWAY__"
+          hostnames: ["host.docker.internal"]
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001            # emptyDir 由 kubelet 以 root 创建，必须给 fsGroup 才能写
+      containers:
+        - name: alert
+          image: fiscal-alert:1.0.0
+          imagePullPolicy: IfNotPresent
+          # 只写 args 会替换镜像 CMD，导致入口变成 "--host" 而 CrashLoop
+          command: ["python", "/app/alert_service.py"]
+          args: ["--host", "0.0.0.0", "--port", "8902", "--interval", "60"]
+          ports:
+            - name: http
+              containerPort: 8902
+          envFrom:
+            - configMapRef: { name: fiscal-alert-config }
+          # 告警历史落盘，需持久化
+          volumeMounts:
+            - name: alert-data
+              mountPath: /app/data
+          startupProbe:                     # 首轮要查 6 个 PromQL，最长可能 60s
+            httpGet: { path: /livez, port: 8902 }
+            failureThreshold: 20
+            periodSeconds: 5
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet: { path: /health, port: 8902 }   # 依赖不可达 → 503
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /livez, port: 8902 }    # 只判进程存活，不能因 Prometheus 故障自杀
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "300m", memory: "384Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: alert-data
+          emptyDir: {}     # 演示用；生产改 PVC
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fiscal-alert
+  namespace: fiscal
+spec:
+  selector: { app: fiscal-alert }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8902
+  type: ClusterIP
+---
+# PodDisruptionBudget：滚动更新/节点维护时保证至少 1 个问答副本可用
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fiscal-qa-pdb
+  namespace: fiscal
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: fiscal-qa }

@@ -1,0 +1,32 @@
+# 本地 Embedding 服务镜像（bge-m3，OpenAI 兼容）
+# 构建：docker build -f serving/Dockerfile.embed -t fiscal-embed:1.0.0 .
+# 运行：docker run -d -p 8900:8900 -v <bge-m3 目录>:/models/bge-m3:ro \
+#         -e MODEL_PATH=/models/bge-m3 fiscal-embed:1.0.0
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    HOST=0.0.0.0 \
+    PORT=8900 \
+    MODEL_PATH=/models/bge-m3 \
+    EMBED_DEVICE=cpu
+
+WORKDIR /app
+
+# torch 单独走 CPU 源，避免默认拉 GPU 版（镜像会大几个 GB）
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+COPY serving/requirements-embed.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY serving/embed_server.py /app/embed_server.py
+
+# 模型目录挂载点（权重不打进镜像）
+RUN useradd -m -u 10001 appuser && mkdir -p /models && chown -R appuser:appuser /app /models
+USER appuser
+
+EXPOSE 8900
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8900/health',timeout=5)"
+
+# 注意：模型权重不打进镜像（几百 MB~GB），用 volume 挂载到 /models/bge-m3（只读即可）
+CMD ["python", "embed_server.py", "--host", "0.0.0.0", "--port", "8900"]

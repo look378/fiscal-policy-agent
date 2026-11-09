@@ -1,0 +1,75 @@
+# Prometheus 自身告警规则（不依赖 alert_service）
+# 目的：当 alert_service 或 qa_service 整体不可用时，仍然有独立的告警信号。
+#
+# 注意：本仓库**没有部署 Alertmanager**，也没有配置 Grafana 的 Contact Point，
+# 因此这些规则的 firing 状态只在 Prometheus UI/API（/alerts）可见，不会主动推送。
+# 需要推送时：加 Alertmanager + alerting 配置，或改 Grafana 托管规则 + Webhook/邮件。
+groups:
+  - name: fiscal-availability
+    rules:
+      - alert: FiscalQaServiceDown
+        expr: up{job="fiscal-qa-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "问答服务不可用（Prometheus 抓不到 /metrics）"
+          description: "fiscal-qa-service 的 up=0 已持续 2 分钟，检查 8901 进程与 /livez。"
+
+      - alert: FiscalAlertServiceDown
+        expr: up{job="fiscal-alert-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "预警服务不可用"
+          description: "fiscal-alert-service 的 up=0 已持续 2 分钟，告警将无人处理。"
+
+      - alert: FiscalQaTargetMissing
+        expr: absent(up{job="fiscal-qa-service"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "问答服务的抓取目标消失（不是 down，是 target 配置/重载问题）"
+
+      - alert: FiscalAlertTargetMissing
+        expr: absent(up{job="fiscal-alert-service"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "预警服务的抓取目标消失"
+
+      # 比例型规则加最小样本量门限（与 alert_service MIN_SAMPLES=5 保持一致），
+      # 避免低流量下"3 次请求 1 次失败"就触发。
+      - alert: FiscalQaHighErrorRate
+        expr: |
+          (sum(rate(fiscal_qa_errors_total[5m])) /
+           clamp_min(sum(rate(fiscal_qa_requests_total[5m])), 0.0001) > 0.10)
+          and (sum(increase(fiscal_qa_requests_total[5m])) >= 5)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "问答服务错误率 > 10%（样本量 ≥5，持续 5 分钟）"
+
+      - alert: FiscalQaHighLatency
+        expr: |
+          (sum(rate(fiscal_qa_latency_ms_total[5m])) /
+           clamp_min(sum(rate(fiscal_qa_requests_total[5m])), 0.0001) > 20000)
+          and (sum(increase(fiscal_qa_requests_total[5m])) >= 5)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "问答平均延迟 > 20s（样本量 ≥5，持续 10 分钟）"
+
+      - alert: FiscalAlertServiceStalled
+        expr: |
+          time() - fiscal_alert_last_check_timestamp_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "预警服务检查线程停滞（last_check > 5 分钟）"
